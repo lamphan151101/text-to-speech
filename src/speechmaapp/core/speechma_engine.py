@@ -45,23 +45,71 @@ _session = requests.Session()
 _session.headers.update(_HEADERS)
 _session_lock = threading.Lock()
 
-# Rate limiter: speechma.com free tier allows ~30 req/min; enforce 2.5s minimum
-# between consecutive API calls so bursting never exceeds ~24 req/min regardless
-# of concurrency setting.
-_rate_lock = threading.Lock()
-_last_api_call_time: float = 0.0
-_MIN_CALL_INTERVAL = 2.5  # seconds
+class _RateLimiter:
+    """Adaptive token-bucket rate limiter.
+
+    • Starts full (capacity = concurrency) → first N calls fire in parallel.
+    • Refills at rate_per_min/60 tokens/sec; sleep() outside lock so threads
+      wait concurrently instead of serialising.
+    • On 429  → rate × 0.7 (floor 20/min), bucket drained.
+    • On success streak → rate × 1.15 every RECOVERY_EVERY calls, capped at
+      DEFAULT_RATE so we gradually return to full speed after a backoff.
+    """
+
+    _DEFAULT_RATE: float = 50.0     # req/min; evidence: 59 calls @ ~120/min worked
+    _MIN_RATE: float = 20.0         # floor after repeated 429s
+    _RECOVERY_EVERY: int = 20       # successful calls before stepping rate back up
+
+    def __init__(self, rate_per_min: float | None = None, capacity: int = 2) -> None:
+        self._default = (rate_per_min or self._DEFAULT_RATE) / 60.0
+        self._rate = self._default
+        self._cap = float(capacity)
+        self._tokens = self._cap
+        self._last = time.monotonic()
+        self._ok = 0               # consecutive successes since last backoff
+        self._lock = threading.Lock()
+
+    def set_capacity(self, n: int) -> None:
+        """Resize burst window to match concurrency; refills the bucket."""
+        with self._lock:
+            self._cap = float(max(1, n))
+            self._tokens = self._cap
+
+    def acquire(self) -> None:
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._tokens = min(
+                    self._cap,
+                    self._tokens + (now - self._last) * self._rate,
+                )
+                self._last = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) / self._rate
+            time.sleep(wait)  # sleep OUTSIDE lock — threads wait concurrently
+
+    def on_success(self) -> None:
+        """Gradually restore rate after a backoff (every RECOVERY_EVERY successes)."""
+        with self._lock:
+            self._ok += 1
+            if self._ok >= self._RECOVERY_EVERY:
+                self._ok = 0
+                self._rate = min(self._rate * 1.15, self._default)
+
+    def on_429(self) -> None:
+        """Back off: −30 % rate, drain bucket, reset success streak."""
+        with self._lock:
+            self._ok = 0
+            self._rate = max(self._rate * 0.7, self._MIN_RATE / 60.0)
+            self._tokens = 0.0
+            log_error(
+                f"RateLimiter throttled to {self._rate * 60:.1f} req/min after 429"
+            )
 
 
-def _rate_wait() -> None:
-    """Block until _MIN_CALL_INTERVAL has elapsed since the last API call."""
-    with _rate_lock:
-        global _last_api_call_time
-        elapsed = time.monotonic() - _last_api_call_time
-        wait = _MIN_CALL_INTERVAL - elapsed
-        if wait > 0:
-            time.sleep(wait)
-        _last_api_call_time = time.monotonic()
+_limiter = _RateLimiter()
 
 # Callback invoked when captcha is needed; set by the UI layer.
 # Signature: (image_bytes: bytes) -> str | None  (returns code or None to cancel)
@@ -157,7 +205,7 @@ def synthesize_one(
     last_exc: BaseException | None = None
 
     for attempt in range(retries):
-        _rate_wait()
+        _limiter.acquire()
         try:
             resp = _session.post(
                 _TTS_URL,
@@ -168,8 +216,8 @@ def synthesize_one(
             if resp.status_code in (401, 403):
                 raise RuntimeError(f"Session expired (HTTP {resp.status_code}) — captcha required")
             if resp.status_code == 429:
-                # Parse Retry-After; default 30s if header absent
                 retry_after = int(resp.headers.get("Retry-After", 30))
+                _limiter.on_429()
                 log_error(
                     f"SpeechmaEngine 429 rate-limited voice={voice} attempt={attempt + 1}/{retries} "
                     f"— backing off {retry_after}s"
@@ -185,6 +233,7 @@ def synthesize_one(
             if not ct.startswith("audio/"):
                 raise RuntimeError(f"Unexpected Content-Type: {ct} — body: {resp.text[:200]}")
             Path(out_path).write_bytes(resp.content)
+            _limiter.on_success()
             log_info(
                 f"SpeechmaEngine OK url={_TTS_URL} voice={voice} "
                 f"size={len(resp.content)} bytes attempt={attempt + 1}"
@@ -219,6 +268,7 @@ def synthesize_batch(
     if not jobs:
         return
     concurrency = max(1, min(concurrency, 4))
+    _limiter.set_capacity(concurrency)  # burst window = concurrency threads
     log_info(f"Batch synth start jobs={len(jobs)} concurrency={concurrency}")
 
     def _run_one(job: TtsJob) -> tuple[TtsJob, bool, BaseException | None]:

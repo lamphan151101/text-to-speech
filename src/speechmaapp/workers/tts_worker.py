@@ -64,10 +64,15 @@ class TtsWorker(QThread):
             session_dir.mkdir(parents=True, exist_ok=True)
             self._update_registry(sessions_root, session_key, "running", session_dir)
 
-            targets = self._collect_targets()
-            total = max(len(targets), 1)
+            targets = self._collect_targets(session_dir)
+            cached_count = len(self.segments) - len(targets)
+            total = max(len(self.segments), 1)
+            # Pre-credit already-synthesized segments so progress bar is accurate
+            processed_count = cached_count
+            if cached_count:
+                log_info(f"Cache-aware: skipping {cached_count} already-synthesized segments")
+                self.progress.emit(int((processed_count / total) * 80))
             failed_segments: list[int] = []
-            processed_count = 0
             _lock = threading.Lock()
 
             original_dir = Path(self.config.audio_root) / self.source_name
@@ -143,11 +148,18 @@ class TtsWorker(QThread):
             log_error(f"Export failed: {exc}")
             self.error.emit(str(exc))
 
-    def _collect_targets(self) -> list[Segment]:
-        if not self.retry_only_indices:
-            return list(self.segments)
-        retry_set = set(self.retry_only_indices)
-        return [seg for seg in self.segments if seg.index in retry_set]
+    def _collect_targets(self, session_dir: Path | None = None) -> list[Segment]:
+        if self.retry_only_indices:
+            retry_set = set(self.retry_only_indices)
+            return [seg for seg in self.segments if seg.index in retry_set]
+        if session_dir is not None:
+            # Skip segments whose MP3 is already synthesized and non-empty
+            return [
+                seg for seg in self.segments
+                if not (p := session_dir / f"segment_{seg.index:04d}.mp3").is_file()
+                or p.stat().st_size < 512
+            ]
+        return list(self.segments)
 
     def _collect_all_segment_paths(self, session_dir: Path) -> list[str]:
         paths: list[str] = []
