@@ -1,0 +1,190 @@
+import json
+import shutil
+import threading
+from datetime import datetime
+from pathlib import Path
+
+from PySide6.QtCore import QThread, Signal
+
+from speechmaapp.config import AppConfig
+from speechmaapp.core.audio_processor import (
+    build_timeline_audio,
+    concatenate_audio_files_to_mp3,
+    export_single_mp3,
+)
+from speechmaapp.core.speechma_engine import TtsJob, synthesize_batch
+from speechmaapp.models.subtitle import Segment
+from speechmaapp.utils.logging_utils import log_error, log_info
+
+
+class TtsWorker(QThread):
+    progress = Signal(int)
+    finished = Signal(str)
+    incomplete = Signal(object)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        config: AppConfig,
+        source_name: str,
+        source_file_name: str,
+        source_md5: str,
+        segments: list[Segment],
+        segment_voice_map: dict[int, str],
+        segment_pitch_map: dict[int, int],
+        segment_rate_map: dict[int, int],
+        output_path: str,
+        save_original: bool,
+        retry_only_indices: list[int] | None = None,
+        is_text_input: bool = False,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.source_name = source_name
+        self.source_file_name = source_file_name
+        self.source_md5 = source_md5
+        self.segments = segments
+        self.segment_voice_map = segment_voice_map
+        self.segment_pitch_map = segment_pitch_map
+        self.segment_rate_map = segment_rate_map
+        self.output_path = output_path
+        self.save_original = save_original
+        self.retry_only_indices = retry_only_indices or []
+        self.is_text_input = is_text_input
+
+    def run(self) -> None:
+        try:
+            log_info(
+                f"Export start source={self.source_name} md5={self.source_md5} "
+                f"segments={len(self.segments)} output={self.output_path}"
+            )
+            sessions_root = Path(self.config.temp_dir) / "export_sessions"
+            session_key = f"{self.source_name}_{self.source_md5}"
+            session_dir = sessions_root / session_key
+            session_dir.mkdir(parents=True, exist_ok=True)
+            self._update_registry(sessions_root, session_key, "running", session_dir)
+
+            targets = self._collect_targets()
+            total = max(len(targets), 1)
+            failed_segments: list[int] = []
+            processed_count = 0
+            _lock = threading.Lock()
+
+            original_dir = Path(self.config.audio_root) / self.source_name
+            if self.save_original:
+                original_dir.mkdir(parents=True, exist_ok=True)
+
+            jobs: list[TtsJob] = []
+            for seg in targets:
+                voice = self.segment_voice_map.get(seg.index, "")
+                if not voice:
+                    with _lock:
+                        failed_segments.append(seg.index)
+                        processed_count += 1
+                    self.progress.emit(int((processed_count / total) * 80))
+                    log_error(f"Skip segment={seg.index} reason=no_voice")
+                    continue
+                jobs.append(
+                    TtsJob(
+                        seg_index=seg.index,
+                        text=seg.text,
+                        voice=voice,
+                        out_path=str(session_dir / f"segment_{seg.index:04d}.mp3"),
+                        pitch=self.segment_pitch_map.get(seg.index, 0),
+                        rate=self.segment_rate_map.get(seg.index, 0),
+                    )
+                )
+
+            def _on_done(job: TtsJob, ok: bool, exc: BaseException | None) -> None:
+                nonlocal processed_count
+                with _lock:
+                    if ok:
+                        if self.save_original:
+                            shutil.copy2(job.out_path, str(original_dir / Path(job.out_path).name))
+                    else:
+                        failed_segments.append(job.seg_index)
+                        log_error(f"Segment synth failed segment={job.seg_index}: {exc}")
+                    processed_count += 1
+                self.progress.emit(int((processed_count / total) * 80))
+
+            if jobs:
+                settings = self.config.load_settings()
+                concurrency = max(1, min(int(settings.tts_concurrency), 4))
+                log_info(f"Start synth batch jobs={len(jobs)} concurrency={concurrency}")
+                synthesize_batch(jobs=jobs, concurrency=concurrency, on_done=_on_done)
+            else:
+                log_info("No synth jobs queued")
+
+            if failed_segments:
+                failed_sorted = sorted(set(failed_segments))
+                log_error(f"Synthesis incomplete failed_segments={failed_sorted}")
+                self._update_registry(sessions_root, session_key, "incomplete", session_dir, failed_sorted)
+                self.incomplete.emit(failed_sorted)
+                return
+
+            raw_paths = self._collect_all_segment_paths(session_dir)
+            if len(self.segments) == 1:
+                log_info("Single segment export mode")
+                export_single_mp3(raw_paths[0], self.output_path)
+            elif self.is_text_input:
+                log_info("TXT sequential export mode")
+                concatenate_audio_files_to_mp3(raw_paths, self.output_path)
+            else:
+                log_info("Timeline export mode")
+                build_timeline_audio(self.segments, raw_paths, self.output_path, session_dir)
+
+            self.progress.emit(100)
+            log_info(f"Export completed output={self.output_path}")
+            self._update_registry(sessions_root, session_key, "completed", session_dir, [])
+            shutil.rmtree(session_dir, ignore_errors=True)
+            self.finished.emit(self.output_path)
+
+        except Exception as exc:
+            log_error(f"Export failed: {exc}")
+            self.error.emit(str(exc))
+
+    def _collect_targets(self) -> list[Segment]:
+        if not self.retry_only_indices:
+            return list(self.segments)
+        retry_set = set(self.retry_only_indices)
+        return [seg for seg in self.segments if seg.index in retry_set]
+
+    def _collect_all_segment_paths(self, session_dir: Path) -> list[str]:
+        paths: list[str] = []
+        missing: list[int] = []
+        for seg in self.segments:
+            file_path = session_dir / f"segment_{seg.index:04d}.mp3"
+            if not file_path.exists():
+                missing.append(seg.index)
+            paths.append(str(file_path))
+        if missing:
+            raise RuntimeError(
+                f"Thiếu file segment trung gian: {', '.join(str(i) for i in missing)}. "
+                "Hãy bấm Xuất MP3 để tạo lại các segment lỗi."
+            )
+        return paths
+
+    def _update_registry(
+        self,
+        sessions_root: Path,
+        session_key: str,
+        status: str,
+        session_dir: Path,
+        failed_segments: list[int] | None = None,
+    ) -> None:
+        registry_path = sessions_root / "sessions_index.json"
+        sessions_root.mkdir(parents=True, exist_ok=True)
+        try:
+            raw = json.loads(registry_path.read_text(encoding="utf-8")) if registry_path.exists() else {}
+        except Exception:
+            raw = {}
+        raw[session_key] = {
+            "source_file_name": self.source_file_name,
+            "source_name": self.source_name,
+            "source_md5": self.source_md5,
+            "session_dir": str(session_dir),
+            "status": status,
+            "failed_segments": failed_segments or [],
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        registry_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")

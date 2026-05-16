@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE / tools
+.claude/
+.vscode/
+.idea/
+
+# App runtime directories
+Audio/
+temp/
+logs/
+
+# Test / temp output files
+test_out.mp3
+*.tmp
+
+# OS
+Thumbs.db
+.DS_Store
