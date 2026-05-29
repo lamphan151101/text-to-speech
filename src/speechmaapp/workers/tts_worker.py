@@ -1,6 +1,8 @@
+import hashlib
 import json
 import shutil
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -9,10 +11,11 @@ from PySide6.QtCore import QThread, Signal
 from speechmaapp.config import AppConfig
 from speechmaapp.core.audio_processor import (
     build_timeline_audio,
+    build_timeline_audio_fast,
     concatenate_audio_files_to_mp3,
     export_single_mp3,
 )
-from speechmaapp.core.speechma_engine import TtsJob, synthesize_batch
+from speechmaapp.core.speechma_engine import TtsJob, configure_proxy_failover, synthesize_batch
 from speechmaapp.models.subtitle import Segment
 from speechmaapp.utils.logging_utils import log_error, log_info
 
@@ -54,6 +57,7 @@ class TtsWorker(QThread):
 
     def run(self) -> None:
         try:
+            export_started = time.perf_counter()
             log_info(
                 f"Export start source={self.source_name} md5={self.source_md5} "
                 f"segments={len(self.segments)} output={self.output_path}"
@@ -64,6 +68,8 @@ class TtsWorker(QThread):
             session_dir.mkdir(parents=True, exist_ok=True)
             self._update_registry(sessions_root, session_key, "running", session_dir)
 
+            cache_dir = Path(self.config.temp_dir) / "tts_cache"
+            self._restore_segment_cache(session_dir, cache_dir)
             targets = self._collect_targets(session_dir)
             cached_count = len(self.segments) - len(targets)
             total = max(len(self.segments), 1)
@@ -104,6 +110,7 @@ class TtsWorker(QThread):
                 nonlocal processed_count
                 with _lock:
                     if ok:
+                        self._save_segment_cache(job, cache_dir)
                         if self.save_original:
                             shutil.copy2(job.out_path, str(original_dir / Path(job.out_path).name))
                     else:
@@ -114,9 +121,12 @@ class TtsWorker(QThread):
 
             if jobs:
                 settings = self.config.load_settings()
-                concurrency = max(1, min(int(settings.tts_concurrency), 4))
+                configure_proxy_failover(settings)
+                concurrency = 1
                 log_info(f"Start synth batch jobs={len(jobs)} concurrency={concurrency}")
+                synth_started = time.perf_counter()
                 synthesize_batch(jobs=jobs, concurrency=concurrency, on_done=_on_done)
+                log_info(f"Synth batch elapsed={time.perf_counter() - synth_started:.2f}s")
             else:
                 log_info("No synth jobs queued")
 
@@ -128,6 +138,8 @@ class TtsWorker(QThread):
                 return
 
             raw_paths = self._collect_all_segment_paths(session_dir)
+            render_started = time.perf_counter()
+            self.progress.emit(85)
             if len(self.segments) == 1:
                 log_info("Single segment export mode")
                 export_single_mp3(raw_paths[0], self.output_path)
@@ -136,10 +148,15 @@ class TtsWorker(QThread):
                 concatenate_audio_files_to_mp3(raw_paths, self.output_path)
             else:
                 log_info("Timeline export mode")
-                build_timeline_audio(self.segments, raw_paths, self.output_path, session_dir)
+                try:
+                    build_timeline_audio_fast(self.segments, raw_paths, self.output_path)
+                except Exception as exc:
+                    log_error(f"Fast timeline export failed, falling back to legacy path: {exc}")
+                    build_timeline_audio(self.segments, raw_paths, self.output_path, session_dir)
+            log_info(f"Audio render elapsed={time.perf_counter() - render_started:.2f}s")
 
             self.progress.emit(100)
-            log_info(f"Export completed output={self.output_path}")
+            log_info(f"Export completed output={self.output_path} elapsed={time.perf_counter() - export_started:.2f}s")
             self._update_registry(sessions_root, session_key, "completed", session_dir, [])
             shutil.rmtree(session_dir, ignore_errors=True)
             self.finished.emit(self.output_path)
@@ -175,6 +192,63 @@ class TtsWorker(QThread):
                 "Hãy bấm Xuất MP3 để tạo lại các segment lỗi."
             )
         return paths
+
+    def _restore_segment_cache(self, session_dir: Path, cache_dir: Path) -> None:
+        restored = 0
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        for seg in self.segments:
+            out_path = session_dir / f"segment_{seg.index:04d}.mp3"
+            if out_path.is_file() and out_path.stat().st_size >= 512:
+                continue
+            cache_path = self._cache_path_for_segment(seg, cache_dir)
+            if cache_path is None or not cache_path.is_file() or cache_path.stat().st_size < 512:
+                continue
+            shutil.copy2(cache_path, out_path)
+            restored += 1
+        if restored:
+            log_info(f"Restored cached TTS segments count={restored}")
+
+    def _save_segment_cache(self, job: TtsJob, cache_dir: Path) -> None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = self._cache_path_for_values(
+            text=job.text,
+            voice=job.voice,
+            pitch=job.pitch,
+            rate=job.rate,
+            cache_dir=cache_dir,
+        )
+        try:
+            shutil.copy2(job.out_path, cache_path)
+        except Exception as exc:
+            log_error(f"Save segment cache failed segment={job.seg_index}: {exc}")
+
+    def _cache_path_for_segment(self, seg: Segment, cache_dir: Path) -> Path | None:
+        voice = self.segment_voice_map.get(seg.index, "")
+        if not voice:
+            return None
+        return self._cache_path_for_values(
+            text=seg.text,
+            voice=voice,
+            pitch=self.segment_pitch_map.get(seg.index, 0),
+            rate=self.segment_rate_map.get(seg.index, 0),
+            cache_dir=cache_dir,
+        )
+
+    def _cache_path_for_values(
+        self,
+        text: str,
+        voice: str,
+        pitch: int,
+        rate: int,
+        cache_dir: Path,
+    ) -> Path:
+        payload = json.dumps(
+            {"text": text, "voice": voice, "pitch": pitch, "rate": rate},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return cache_dir / f"{digest}.mp3"
 
     def _update_registry(
         self,

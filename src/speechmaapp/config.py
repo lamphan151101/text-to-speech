@@ -1,6 +1,13 @@
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+
+@dataclass
+class ProxyProfile:
+    name: str
+    http: str = ""
+    https: str = ""
 
 
 @dataclass
@@ -10,6 +17,10 @@ class Settings:
     last_language_group: str
     language: str
     tts_concurrency: int
+    proxy_failover_enabled: bool = False
+    slow_response_seconds: int = 20
+    proxy_cooldown_seconds: int = 300
+    proxy_profiles: list[ProxyProfile] = field(default_factory=list)
 
 
 class AppConfig:
@@ -47,7 +58,7 @@ class AppConfig:
             save_original_audio=False,
             last_language_group="Vietnamese",
             language="vi",
-            tts_concurrency=2,
+            tts_concurrency=1,
         )
         if not self.settings_path.exists():
             return default
@@ -59,6 +70,14 @@ class AppConfig:
                 last_language_group=raw.get("last_language_group", default.last_language_group),
                 language=raw.get("language", default.language),
                 tts_concurrency=self._clamp(raw.get("tts_concurrency", default.tts_concurrency)),
+                proxy_failover_enabled=bool(raw.get("proxy_failover_enabled", False)),
+                slow_response_seconds=self._clamp_range(
+                    raw.get("slow_response_seconds", 20), lo=5, hi=120
+                ),
+                proxy_cooldown_seconds=self._clamp_range(
+                    raw.get("proxy_cooldown_seconds", 300), lo=30, hi=3600
+                ),
+                proxy_profiles=self._parse_proxy_profiles(raw.get("proxy_profiles", [])),
             )
         except (OSError, json.JSONDecodeError):
             return default
@@ -70,6 +89,13 @@ class AppConfig:
             "last_language_group": settings.last_language_group,
             "language": settings.language,
             "tts_concurrency": self._clamp(settings.tts_concurrency),
+            "proxy_failover_enabled": settings.proxy_failover_enabled,
+            "slow_response_seconds": settings.slow_response_seconds,
+            "proxy_cooldown_seconds": settings.proxy_cooldown_seconds,
+            "proxy_profiles": [
+                {"name": p.name, "http": p.http, "https": p.https}
+                for p in settings.proxy_profiles
+            ],
         }
         self.settings_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -78,5 +104,29 @@ class AppConfig:
         try:
             parsed = int(value)
         except (TypeError, ValueError):
-            parsed = 2
-        return max(1, min(parsed, 4))
+            parsed = 1
+        return max(1, min(parsed, 1))
+
+    @staticmethod
+    def _clamp_range(value: object, lo: int, hi: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = lo
+        return max(lo, min(parsed, hi))
+
+    @staticmethod
+    def _parse_proxy_profiles(raw: object) -> list[ProxyProfile]:
+        if not isinstance(raw, list):
+            return []
+        result: list[ProxyProfile] = []
+        for idx, item in enumerate(raw, start=1):
+            if not isinstance(item, dict):
+                continue
+            http = str(item.get("http", "")).strip()
+            https = str(item.get("https", "")).strip()
+            if not http and not https:
+                continue  # skip empty profiles
+            name = str(item.get("name", f"proxy-{idx}")).strip() or f"proxy-{idx}"
+            result.append(ProxyProfile(name=name, http=http, https=https))
+        return result

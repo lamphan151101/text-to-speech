@@ -13,16 +13,22 @@ Captcha flow (required for session):
 from __future__ import annotations
 
 import json
+import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import requests
+from requests.adapters import HTTPAdapter
 
+from speechmaapp.core.proxy_manager import ProxyManager
 from speechmaapp.utils.logging_utils import log_error, log_info
+
+if TYPE_CHECKING:
+    from speechmaapp.config import Settings
 
 _BASE_URL = "https://speechma.com"
 _TTS_URL = f"{_BASE_URL}/com.api/tts-api.php"
@@ -43,6 +49,7 @@ _HEADERS = {
 # Module-level session shared across all calls (thread-safe for reads)
 _session = requests.Session()
 _session.headers.update(_HEADERS)
+_session.mount("https://", HTTPAdapter(pool_connections=16, pool_maxsize=16))
 _session_lock = threading.Lock()
 
 class _RateLimiter:
@@ -56,24 +63,28 @@ class _RateLimiter:
       DEFAULT_RATE so we gradually return to full speed after a backoff.
     """
 
-    _DEFAULT_RATE: float = 50.0     # req/min; evidence: 59 calls @ ~120/min worked
-    _MIN_RATE: float = 20.0         # floor after repeated 429s
-    _RECOVERY_EVERY: int = 20       # successful calls before stepping rate back up
+    _DEFAULT_RATE: float = 24.0
+    _MAX_RATE: float = 36.0
+    _MIN_RATE: float = 6.0
+    _RECOVERY_EVERY: int = 30
 
     def __init__(self, rate_per_min: float | None = None, capacity: int = 2) -> None:
         self._default = (rate_per_min or self._DEFAULT_RATE) / 60.0
         self._rate = self._default
+        self._max_rate = self._MAX_RATE / 60.0
         self._cap = float(capacity)
-        self._tokens = self._cap
+        self._tokens = 1.0
         self._last = time.monotonic()
         self._ok = 0               # consecutive successes since last backoff
+        self._cooldown_until = 0.0
+        self._last_throttle_log = 0.0
         self._lock = threading.Lock()
 
     def set_capacity(self, n: int) -> None:
-        """Resize burst window to match concurrency; refills the bucket."""
+        """Resize burst window without creating a request spike."""
         with self._lock:
             self._cap = float(max(1, n))
-            self._tokens = self._cap
+            self._tokens = min(max(self._tokens, 1.0), self._cap)
 
     def acquire(self) -> None:
         while True:
@@ -109,7 +120,136 @@ class _RateLimiter:
             )
 
 
-_limiter = _RateLimiter()
+class _StableRateLimiter:
+    """Shared request queue limiter with a global cooldown for HTTP 429."""
+
+    _DEFAULT_RATE: float = 4.0
+    _MAX_RATE: float = 8.0
+    _MIN_RATE: float = 1.0
+    _RECOVERY_EVERY: int = 50
+    _MAX_COOLDOWN_SECONDS: float = 900.0
+
+    def __init__(self, rate_per_min: float | None = None, capacity: int = 2) -> None:
+        self._default = (rate_per_min or self._DEFAULT_RATE) / 60.0
+        self._rate = self._default
+        self._max_rate = self._MAX_RATE / 60.0
+        self._cap = float(capacity)
+        self._tokens = 1.0
+        self._last = time.monotonic()
+        self._ok = 0
+        self._fail_streak = 0
+        self._cooldown_until = 0.0
+        self._last_throttle_log = 0.0
+        self._lock = threading.Lock()
+
+    def set_capacity(self, n: int) -> None:
+        with self._lock:
+            self._cap = float(max(1, n))
+            self._tokens = min(max(self._tokens, 1.0), self._cap)
+
+    def acquire(self) -> None:
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                if now < self._cooldown_until:
+                    wait = self._cooldown_until - now
+                else:
+                    self._tokens = min(
+                        self._cap,
+                        self._tokens + (now - self._last) * self._rate,
+                    )
+                    self._last = now
+                    if self._tokens >= 1.0:
+                        self._tokens -= 1.0
+                        return
+                    wait = (1.0 - self._tokens) / self._rate
+            time.sleep(wait)
+
+    def on_success(self) -> None:
+        with self._lock:
+            self._ok += 1
+            self._fail_streak = 0
+            if self._ok >= self._RECOVERY_EVERY:
+                self._ok = 0
+                self._rate = min(self._rate * 1.10, self._default, self._max_rate)
+
+    def on_429(self, retry_after: int) -> float:
+        with self._lock:
+            now = time.monotonic()
+            self._ok = 0
+            self._fail_streak += 1
+            self._rate = max(self._rate * 0.5, self._MIN_RATE / 60.0)
+            self._tokens = 0.0
+            self._last = now
+            backoff_factor = min(2 ** (self._fail_streak - 1), 16)
+            cooldown = min(
+                max(float(retry_after), 30.0) * backoff_factor + random.uniform(2.0, 8.0),
+                self._MAX_COOLDOWN_SECONDS,
+            )
+            self._cooldown_until = max(self._cooldown_until, now + cooldown)
+            wait = self._cooldown_until - now
+            if now - self._last_throttle_log >= 10.0:
+                self._last_throttle_log = now
+                log_info(
+                    f"RateLimiter global cooldown {wait:.1f}s; "
+                    f"new rate={self._rate * 60:.1f} req/min after 429 "
+                    f"streak={self._fail_streak}"
+                )
+            return wait
+
+
+_limiter = _StableRateLimiter()
+
+# Proxy failover manager — None means direct connection (default).
+# Initialised by configure_proxy_failover() called from TtsWorker.run().
+_proxy_manager: ProxyManager | None = None
+
+
+def configure_proxy_failover(settings: "Settings") -> None:
+    """Build and activate a ProxyManager from the current app settings."""
+    global _proxy_manager
+    _proxy_manager = ProxyManager(
+        profiles=settings.proxy_profiles,
+        enabled=settings.proxy_failover_enabled,
+        slow_response_seconds=settings.slow_response_seconds,
+        cooldown_seconds=settings.proxy_cooldown_seconds,
+    )
+
+
+def _tts_request(payload: str, timeout: int = 90) -> "requests.Response":
+    """Make a single POST to the TTS endpoint, routing through the current proxy.
+
+    Reports network-level failures and gateway errors to the ProxyManager so
+    it can rotate to the next proxy for the following request.  429 is NOT
+    reported here — it is handled by the rate-limiter in synthesize_one().
+    """
+    proxies = _proxy_manager.current_proxies() if _proxy_manager else None
+    proxy_name = _proxy_manager.current_name() if _proxy_manager else "direct"
+    start = time.perf_counter()
+    try:
+        resp = _session.post(
+            _TTS_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            proxies=proxies,
+            timeout=timeout,
+        )
+        elapsed = time.perf_counter() - start
+        if _proxy_manager:
+            if _proxy_manager.should_switch_for_status(resp.status_code):
+                _proxy_manager.report_failure(f"http_{resp.status_code}")
+            elif resp.status_code != 429:
+                # Don't credit slow-response to 429 — those are quota, not network
+                _proxy_manager.report_success(elapsed)
+        return resp
+    except (requests.Timeout, requests.ConnectionError) as exc:
+        if _proxy_manager:
+            _proxy_manager.report_failure("network_error")
+        log_error(
+            f"SpeechmaEngine network error proxy={proxy_name}: {type(exc).__name__}: {exc}"
+        )
+        raise
+
 
 # Callback invoked when captcha is needed; set by the UI layer.
 # Signature: (image_bytes: bytes) -> str | None  (returns code or None to cancel)
@@ -189,6 +329,13 @@ def _sanitize(text: str) -> str:
     )
 
 
+def _parse_retry_after(value: str | None) -> int:
+    try:
+        return max(int(value or "30"), 1)
+    except ValueError:
+        return 30
+
+
 def synthesize_one(
     text: str,
     voice: str,
@@ -203,27 +350,29 @@ def synthesize_one(
 
     payload = json.dumps({"text": sanitized, "voice": voice, "pitch": pitch, "rate": rate})
     last_exc: BaseException | None = None
+    rate_limit_hits = 0
 
     for attempt in range(retries):
         _limiter.acquire()
         try:
-            resp = _session.post(
-                _TTS_URL,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=90,
-            )
+            resp = _tts_request(payload)
             if resp.status_code in (401, 403):
                 raise RuntimeError(f"Session expired (HTTP {resp.status_code}) — captcha required")
             if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", 30))
-                _limiter.on_429()
-                log_error(
+                rate_limit_hits += 1
+                retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+                wait = _limiter.on_429(retry_after)
+                log_info(
                     f"SpeechmaEngine 429 rate-limited voice={voice} attempt={attempt + 1}/{retries} "
                     f"— backing off {retry_after}s"
                 )
+                if rate_limit_hits >= 8:
+                    raise RuntimeError(
+                        "SpeechMa is still rate-limiting this session after multiple cooldowns. "
+                        "Wait 10-15 minutes, then retry failed segments; completed segments are cached."
+                    )
                 if attempt < retries - 1:
-                    time.sleep(retry_after)
+                    time.sleep(wait)
                     last_exc = RuntimeError(f"HTTP 429 Too Many Requests (Retry-After={retry_after}s)")
                     continue
                 else:
@@ -263,11 +412,11 @@ def synthesize_batch(
     jobs: list[TtsJob],
     concurrency: int,
     on_done: Callable[[TtsJob, bool, BaseException | None], None],
-    retries: int = 5,
+    retries: int = 30,
 ) -> None:
     if not jobs:
         return
-    concurrency = max(1, min(concurrency, 4))
+    concurrency = 1
     _limiter.set_capacity(concurrency)  # burst window = concurrency threads
     log_info(f"Batch synth start jobs={len(jobs)} concurrency={concurrency}")
 

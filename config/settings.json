@@ -3,5 +3,9 @@
   "save_original_audio": false,
   "last_language_group": "Multilingual",
   "language": "vi",
-  "tts_concurrency": 2
+  "tts_concurrency": 1,
+  "proxy_failover_enabled": false,
+  "slow_response_seconds": 20,
+  "proxy_cooldown_seconds": 300,
+  "proxy_profiles": []
 }
