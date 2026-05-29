@@ -204,10 +204,15 @@ _limiter = _StableRateLimiter()
 # Initialised by configure_proxy_failover() called from TtsWorker.run().
 _proxy_manager: ProxyManager | None = None
 
+# Tracks the last proxy name logged so we only print "now using proxy X"
+# when the active proxy actually changes between consecutive TTS calls.
+_active_proxy_name: str = "direct"
+
 
 def configure_proxy_failover(settings: "Settings") -> None:
     """Build and activate a ProxyManager from the current app settings."""
-    global _proxy_manager
+    global _proxy_manager, _active_proxy_name
+    _active_proxy_name = "direct"
     _proxy_manager = ProxyManager(
         profiles=settings.proxy_profiles,
         enabled=settings.proxy_failover_enabled,
@@ -223,8 +228,19 @@ def _tts_request(payload: str, timeout: int = 90) -> "requests.Response":
     it can rotate to the next proxy for the following request.  429 is NOT
     reported here — it is handled by the rate-limiter in synthesize_one().
     """
+    global _active_proxy_name
+
     proxies = _proxy_manager.current_proxies() if _proxy_manager else None
     proxy_name = _proxy_manager.current_name() if _proxy_manager else "direct"
+
+    # Log only when active proxy changes (avoids flooding 518 identical lines)
+    if proxy_name != _active_proxy_name:
+        if proxy_name == "direct":
+            log_info("TTS routing: direct connection (all proxies in cooldown or none configured)")
+        else:
+            log_info(f"TTS routing: switched to proxy [{proxy_name}]")
+        _active_proxy_name = proxy_name
+
     start = time.perf_counter()
     try:
         resp = _session.post(
@@ -235,18 +251,19 @@ def _tts_request(payload: str, timeout: int = 90) -> "requests.Response":
             timeout=timeout,
         )
         elapsed = time.perf_counter() - start
+
         if _proxy_manager:
             if _proxy_manager.should_switch_for_status(resp.status_code):
                 _proxy_manager.report_failure(f"http_{resp.status_code}")
             elif resp.status_code != 429:
-                # Don't credit slow-response to 429 — those are quota, not network
                 _proxy_manager.report_success(elapsed)
+
         return resp
     except (requests.Timeout, requests.ConnectionError) as exc:
         if _proxy_manager:
             _proxy_manager.report_failure("network_error")
         log_error(
-            f"SpeechmaEngine network error proxy={proxy_name}: {type(exc).__name__}: {exc}"
+            f"TTS network error proxy=[{proxy_name}] {type(exc).__name__}: {exc}"
         )
         raise
 
@@ -418,7 +435,11 @@ def synthesize_batch(
         return
     concurrency = 1
     _limiter.set_capacity(concurrency)  # burst window = concurrency threads
-    log_info(f"Batch synth start jobs={len(jobs)} concurrency={concurrency}")
+    initial_proxy = _proxy_manager.current_name() if _proxy_manager else "direct"
+    log_info(
+        f"Batch synth start jobs={len(jobs)} concurrency={concurrency} "
+        f"proxy=[{initial_proxy}]"
+    )
 
     def _run_one(job: TtsJob) -> tuple[TtsJob, bool, BaseException | None]:
         try:

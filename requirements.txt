@@ -1,5 +1,6 @@
 PySide6>=6.7
 requests>=2.32
+PySocks>=1.7
 ffmpeg-python>=0.2
 imageio-ffmpeg>=0.5
 pyinstaller>=6.6
