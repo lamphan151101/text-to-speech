@@ -221,8 +221,16 @@ def configure_proxy_failover(settings: "Settings") -> None:
     )
 
 
-def _tts_request(payload: str, timeout: int = 90) -> "requests.Response":
+_PROXY_CONNECT_TIMEOUT = 8   # seconds — fail-fast on dead proxies; direct uses full value
+_TTS_READ_TIMEOUT = 90       # seconds — TTS synthesis can be slow for long text
+
+
+def _tts_request(payload: str) -> "requests.Response":
     """Make a single POST to the TTS endpoint, routing through the current proxy.
+
+    Uses a split (connect, read) timeout when going through a proxy so that dead
+    proxies are detected in ≤8 s instead of waiting the full 90 s read timeout.
+    Direct connection keeps the full 90 s connect timeout (no proxy overhead).
 
     Reports network-level failures and gateway errors to the ProxyManager so
     it can rotate to the next proxy for the following request.  429 is NOT
@@ -233,13 +241,19 @@ def _tts_request(payload: str, timeout: int = 90) -> "requests.Response":
     proxies = _proxy_manager.current_proxies() if _proxy_manager else None
     proxy_name = _proxy_manager.current_name() if _proxy_manager else "direct"
 
-    # Log only when active proxy changes (avoids flooding 518 identical lines)
+    # Log only when active proxy changes (avoids flooding identical lines)
     if proxy_name != _active_proxy_name:
         if proxy_name == "direct":
-            log_info("TTS routing: direct connection (all proxies in cooldown or none configured)")
+            log_info("TTS routing: direct connection (all proxies unavailable or disabled)")
         else:
             log_info(f"TTS routing: switched to proxy [{proxy_name}]")
         _active_proxy_name = proxy_name
+
+    # Through a proxy: short connect timeout to fail-fast on dead proxies.
+    # Direct: full timeout for both phases (no extra round-trip overhead).
+    timeout: tuple[int, int] | int = (
+        (_PROXY_CONNECT_TIMEOUT, _TTS_READ_TIMEOUT) if proxies else _TTS_READ_TIMEOUT
+    )
 
     start = time.perf_counter()
     try:
@@ -262,9 +276,7 @@ def _tts_request(payload: str, timeout: int = 90) -> "requests.Response":
     except (requests.Timeout, requests.ConnectionError) as exc:
         if _proxy_manager:
             _proxy_manager.report_failure("network_error")
-        log_error(
-            f"TTS network error proxy=[{proxy_name}] {type(exc).__name__}: {exc}"
-        )
+        log_error(f"TTS network error proxy=[{proxy_name}] {type(exc).__name__}: {exc}")
         raise
 
 
@@ -429,7 +441,7 @@ def synthesize_batch(
     jobs: list[TtsJob],
     concurrency: int,
     on_done: Callable[[TtsJob, bool, BaseException | None], None],
-    retries: int = 30,
+    retries: int = 8,
 ) -> None:
     if not jobs:
         return
