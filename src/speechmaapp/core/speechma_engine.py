@@ -24,11 +24,7 @@ from typing import TYPE_CHECKING, Callable
 import requests
 from requests.adapters import HTTPAdapter
 
-from speechmaapp.core.proxy_manager import ProxyManager
 from speechmaapp.utils.logging_utils import log_error, log_info
-
-if TYPE_CHECKING:
-    from speechmaapp.config import Settings
 
 _BASE_URL = "https://speechma.com"
 _TTS_URL = f"{_BASE_URL}/com.api/tts-api.php"
@@ -46,11 +42,41 @@ _HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Module-level session shared across all calls (thread-safe for reads)
+# Module-level session shared across all calls.
+# _session_lock guards resets; individual requests read _session without locking
+# (Python GIL makes attribute reads atomic in CPython).
 _session = requests.Session()
 _session.headers.update(_HEADERS)
 _session.mount("https://", HTTPAdapter(pool_connections=16, pool_maxsize=16))
 _session_lock = threading.Lock()
+_last_session_reset_at: float = 0.0  # monotonic timestamp of last reset
+
+
+def _try_session_reset() -> None:
+    """Create a fresh HTTP session to recover from session-level rate limiting.
+
+    Replaces the global session (new object = no cookies) so the next TTS
+    request arrives without a tracked session ID, effectively resetting the
+    server-side rate-limit counter for this client.  If the server then returns
+    401/403 (captcha needed), synthesize_one() will surface that as a normal
+    error and the user can click the Captcha button to re-authenticate.
+
+    Debounced to once per 10 s so concurrent threads don't each create a new
+    session in the same 429 wave.
+    """
+    global _session, _last_session_reset_at
+    with _session_lock:
+        now = time.monotonic()
+        if now - _last_session_reset_at < 10.0:
+            log_info("Session reset skipped — already reset within 10 s")
+            return
+        _last_session_reset_at = now
+        new_session = requests.Session()
+        new_session.headers.update(_HEADERS)
+        new_session.mount("https://", HTTPAdapter(pool_connections=16, pool_maxsize=16))
+        _session = new_session
+    log_info("Session reset: new HTTP session created (cookies cleared) for rate-limit recovery")
+
 
 class _RateLimiter:
     """Adaptive token-bucket rate limiter.
@@ -121,18 +147,27 @@ class _RateLimiter:
 
 
 class _StableRateLimiter:
-    """Shared request queue limiter with a global cooldown for HTTP 429."""
+    """Shared token-bucket limiter with per-batch concurrency scaling.
 
-    _DEFAULT_RATE: float = 4.0
-    _MAX_RATE: float = 8.0
-    _MIN_RATE: float = 1.0
-    _RECOVERY_EVERY: int = 50
-    _MAX_COOLDOWN_SECONDS: float = 900.0
+    set_capacity(n) must be called once per batch before any acquire() calls.
+    It scales the total rate to n × _DEFAULT_RATE so each thread gets its own
+    budget, and resets cooldown/streak so every export starts clean.
+    """
 
-    def __init__(self, rate_per_min: float | None = None, capacity: int = 2) -> None:
+    _DEFAULT_RATE: float = 10.0   # req/min per thread
+    _MAX_RATE: float = 40.0       # hard ceiling regardless of n
+    _MIN_RATE: float = 4.0        # floor per thread; scales with n
+    _RECOVERY_EVERY: int = 15     # restore rate after N successes
+    _MAX_COOLDOWN_SECONDS: float = 90.0    # cap per 429 wave
+
+    _429_DEBOUNCE_SECS: float = 2.0  # concurrent threads within this window = one event
+
+    def __init__(self, rate_per_min: float | None = None, capacity: int = 1) -> None:
         self._default = (rate_per_min or self._DEFAULT_RATE) / 60.0
-        self._rate = self._default
         self._max_rate = self._MAX_RATE / 60.0
+        self._rate = self._default
+        self._rate_ceiling = self._default     # scales with n in set_capacity
+        self._min_rate_floor = self._MIN_RATE / 60.0  # scales with n in set_capacity
         self._cap = float(capacity)
         self._tokens = 1.0
         self._last = time.monotonic()
@@ -140,12 +175,25 @@ class _StableRateLimiter:
         self._fail_streak = 0
         self._cooldown_until = 0.0
         self._last_throttle_log = 0.0
+        self._last_429_time = 0.0  # debounce: prevent per-thread streak inflation
         self._lock = threading.Lock()
 
     def set_capacity(self, n: int) -> None:
+        """Scale rate and burst window for n parallel threads; resets state for a fresh batch."""
         with self._lock:
-            self._cap = float(max(1, n))
+            n = max(1, n)
+            self._cap = float(n)
             self._tokens = min(max(self._tokens, 1.0), self._cap)
+            # Each thread gets _DEFAULT_RATE budget; total pool = n × default, capped at MAX
+            self._rate_ceiling = min(self._default * n, self._max_rate)
+            self._rate = self._rate_ceiling
+            # Scale floor: n threads → n × MIN_RATE total
+            self._min_rate_floor = self._MIN_RATE * n / 60.0
+            # Fresh start for each export batch
+            self._fail_streak = 0
+            self._cooldown_until = 0.0
+            self._last_429_time = 0.0
+            self._ok = 0
 
     def acquire(self) -> None:
         while True:
@@ -168,22 +216,39 @@ class _StableRateLimiter:
     def on_success(self) -> None:
         with self._lock:
             self._ok += 1
-            self._fail_streak = 0
+            self._fail_streak = 0   # reset: next 429 starts a fresh streak
             if self._ok >= self._RECOVERY_EVERY:
                 self._ok = 0
-                self._rate = min(self._rate * 1.10, self._default, self._max_rate)
+                self._rate = min(self._rate * 1.20, self._rate_ceiling)
+
+    def clear_cooldown(self) -> None:
+        """Lift cooldown and restore full rate (call after a session reset).
+        New session = fresh server-side counter, so we start at ceiling speed again.
+        """
+        with self._lock:
+            self._cooldown_until = 0.0
+            self._rate = self._rate_ceiling   # new session → full budget restored
+            self._tokens = max(self._tokens, 1.0)
+            self._fail_streak = 0
+            self._ok = 0
 
     def on_429(self, retry_after: int) -> float:
         with self._lock:
             now = time.monotonic()
             self._ok = 0
-            self._fail_streak += 1
-            self._rate = max(self._rate * 0.5, self._MIN_RATE / 60.0)
+            # Debounce: concurrent threads hitting 429 simultaneously = one event.
+            # Without this, n threads each decrement rate and increment streak n times
+            # per wave, causing the rate to collapse n× faster than intended.
+            if now - self._last_429_time >= self._429_DEBOUNCE_SECS:
+                self._fail_streak += 1
+                self._rate = max(self._rate * 0.75, self._min_rate_floor)
+                self._last_throttle_log = 0.0  # force a log line on each new wave
+            self._last_429_time = now
             self._tokens = 0.0
             self._last = now
-            backoff_factor = min(2 ** (self._fail_streak - 1), 16)
+            # Fixed cooldown = Retry-After + jitter, no exponential multiplier
             cooldown = min(
-                max(float(retry_after), 30.0) * backoff_factor + random.uniform(2.0, 8.0),
+                max(float(retry_after), 30.0) + random.uniform(2.0, 8.0),
                 self._MAX_COOLDOWN_SECONDS,
             )
             self._cooldown_until = max(self._cooldown_until, now + cooldown)
@@ -191,7 +256,7 @@ class _StableRateLimiter:
             if now - self._last_throttle_log >= 10.0:
                 self._last_throttle_log = now
                 log_info(
-                    f"RateLimiter global cooldown {wait:.1f}s; "
+                    f"RateLimiter cooldown {wait:.1f}s; "
                     f"new rate={self._rate * 60:.1f} req/min after 429 "
                     f"streak={self._fail_streak}"
                 )
@@ -200,83 +265,20 @@ class _StableRateLimiter:
 
 _limiter = _StableRateLimiter()
 
-# Proxy failover manager — None means direct connection (default).
-# Initialised by configure_proxy_failover() called from TtsWorker.run().
-_proxy_manager: ProxyManager | None = None
-
-# Tracks the last proxy name logged so we only print "now using proxy X"
-# when the active proxy actually changes between consecutive TTS calls.
-_active_proxy_name: str = "direct"
-
-
-def configure_proxy_failover(settings: "Settings") -> None:
-    """Build and activate a ProxyManager from the current app settings."""
-    global _proxy_manager, _active_proxy_name
-    _active_proxy_name = "direct"
-    _proxy_manager = ProxyManager(
-        profiles=settings.proxy_profiles,
-        enabled=settings.proxy_failover_enabled,
-        slow_response_seconds=settings.slow_response_seconds,
-        cooldown_seconds=settings.proxy_cooldown_seconds,
-    )
-
-
-_PROXY_CONNECT_TIMEOUT = 8   # seconds — fail-fast on dead proxies; direct uses full value
-_TTS_READ_TIMEOUT = 90       # seconds — TTS synthesis can be slow for long text
+_TTS_READ_TIMEOUT = 90  # seconds — TTS synthesis can be slow for long text
 
 
 def _tts_request(payload: str) -> "requests.Response":
-    """Make a single POST to the TTS endpoint, routing through the current proxy.
-
-    Uses a split (connect, read) timeout when going through a proxy so that dead
-    proxies are detected in ≤8 s instead of waiting the full 90 s read timeout.
-    Direct connection keeps the full 90 s connect timeout (no proxy overhead).
-
-    Reports network-level failures and gateway errors to the ProxyManager so
-    it can rotate to the next proxy for the following request.  429 is NOT
-    reported here — it is handled by the rate-limiter in synthesize_one().
-    """
-    global _active_proxy_name
-
-    proxies = _proxy_manager.current_proxies() if _proxy_manager else None
-    proxy_name = _proxy_manager.current_name() if _proxy_manager else "direct"
-
-    # Log only when active proxy changes (avoids flooding identical lines)
-    if proxy_name != _active_proxy_name:
-        if proxy_name == "direct":
-            log_info("TTS routing: direct connection (all proxies unavailable or disabled)")
-        else:
-            log_info(f"TTS routing: switched to proxy [{proxy_name}]")
-        _active_proxy_name = proxy_name
-
-    # Through a proxy: short connect timeout to fail-fast on dead proxies.
-    # Direct: full timeout for both phases (no extra round-trip overhead).
-    timeout: tuple[int, int] | int = (
-        (_PROXY_CONNECT_TIMEOUT, _TTS_READ_TIMEOUT) if proxies else _TTS_READ_TIMEOUT
-    )
-
-    start = time.perf_counter()
+    """Make a single POST to the TTS endpoint via direct connection."""
     try:
-        resp = _session.post(
+        return _session.post(
             _TTS_URL,
             data=payload,
             headers={"Content-Type": "application/json"},
-            proxies=proxies,
-            timeout=timeout,
+            timeout=_TTS_READ_TIMEOUT,
         )
-        elapsed = time.perf_counter() - start
-
-        if _proxy_manager:
-            if _proxy_manager.should_switch_for_status(resp.status_code):
-                _proxy_manager.report_failure(f"http_{resp.status_code}")
-            elif resp.status_code != 429:
-                _proxy_manager.report_success(elapsed)
-
-        return resp
     except (requests.Timeout, requests.ConnectionError) as exc:
-        if _proxy_manager:
-            _proxy_manager.report_failure("network_error")
-        log_error(f"TTS network error proxy=[{proxy_name}] {type(exc).__name__}: {exc}")
+        log_error(f"TTS network error {type(exc).__name__}: {exc}")
         raise
 
 
@@ -380,6 +382,7 @@ def synthesize_one(
     payload = json.dumps({"text": sanitized, "voice": voice, "pitch": pitch, "rate": rate})
     last_exc: BaseException | None = None
     rate_limit_hits = 0
+    session_reset_attempted = False  # try at most once per synthesize_one call
 
     for attempt in range(retries):
         _limiter.acquire()
@@ -391,9 +394,20 @@ def synthesize_one(
                 rate_limit_hits += 1
                 retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
                 wait = _limiter.on_429(retry_after)
+                # Recovery order:
+                # 1. session_reset — new cookie → fresh server-side counter, no wait
+                # 2. sleep         — wait out Retry-After window
+                if not session_reset_attempted:
+                    session_reset_attempted = True
+                    _try_session_reset()
+                    action = "session_reset"
+                else:
+                    action = "sleep"
+
                 log_info(
                     f"SpeechmaEngine 429 rate-limited voice={voice} attempt={attempt + 1}/{retries} "
-                    f"— backing off {retry_after}s"
+                    f"action={action}"
+                    + ("" if action != "sleep" else f" — backing off {wait:.0f}s (Retry-After={retry_after}s)")
                 )
                 if rate_limit_hits >= 8:
                     raise RuntimeError(
@@ -401,7 +415,10 @@ def synthesize_one(
                         "Wait 10-15 minutes, then retry failed segments; completed segments are cached."
                     )
                 if attempt < retries - 1:
-                    time.sleep(wait)
+                    if action == "session_reset":
+                        _limiter.clear_cooldown()  # new session → fresh budget
+                    else:
+                        time.sleep(wait)
                     last_exc = RuntimeError(f"HTTP 429 Too Many Requests (Retry-After={retry_after}s)")
                     continue
                 else:
@@ -445,13 +462,8 @@ def synthesize_batch(
 ) -> None:
     if not jobs:
         return
-    concurrency = 1
-    _limiter.set_capacity(concurrency)  # burst window = concurrency threads
-    initial_proxy = _proxy_manager.current_name() if _proxy_manager else "direct"
-    log_info(
-        f"Batch synth start jobs={len(jobs)} concurrency={concurrency} "
-        f"proxy=[{initial_proxy}]"
-    )
+    _limiter.set_capacity(concurrency)  # scales rate and burst window
+    log_info(f"Batch synth start jobs={len(jobs)} concurrency={concurrency}")
 
     def _run_one(job: TtsJob) -> tuple[TtsJob, bool, BaseException | None]:
         try:

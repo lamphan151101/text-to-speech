@@ -15,7 +15,7 @@ from speechmaapp.core.audio_processor import (
     concatenate_audio_files_to_mp3,
     export_single_mp3,
 )
-from speechmaapp.core.speechma_engine import TtsJob, configure_proxy_failover, synthesize_batch
+from speechmaapp.core.speechma_engine import TtsJob, synthesize_batch
 from speechmaapp.models.subtitle import Segment
 from speechmaapp.utils.logging_utils import log_error, log_info
 
@@ -121,8 +121,7 @@ class TtsWorker(QThread):
 
             if jobs:
                 settings = self.config.load_settings()
-                configure_proxy_failover(settings)
-                concurrency = 1
+                concurrency = settings.tts_concurrency
                 log_info(f"Start synth batch jobs={len(jobs)} concurrency={concurrency}")
                 synth_started = time.perf_counter()
                 synthesize_batch(jobs=jobs, concurrency=concurrency, on_done=_on_done)

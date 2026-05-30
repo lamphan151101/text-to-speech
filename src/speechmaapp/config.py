@@ -75,7 +75,7 @@ class AppConfig:
                     raw.get("slow_response_seconds", 20), lo=5, hi=120
                 ),
                 proxy_cooldown_seconds=self._clamp_range(
-                    raw.get("proxy_cooldown_seconds", 300), lo=30, hi=3600
+                    raw.get("proxy_cooldown_seconds", 60), lo=30, hi=3600
                 ),
                 proxy_profiles=self._parse_proxy_profiles(raw.get("proxy_profiles", [])),
             )
@@ -105,7 +105,7 @@ class AppConfig:
             parsed = int(value)
         except (TypeError, ValueError):
             parsed = 1
-        return max(1, min(parsed, 1))
+        return max(1, min(parsed, 4))
 
     @staticmethod
     def _clamp_range(value: object, lo: int, hi: int) -> int:

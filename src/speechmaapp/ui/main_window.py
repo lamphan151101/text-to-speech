@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QDialog,
@@ -73,6 +74,13 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self.progress.setVisible(False)
+        self.export_timer_label = QLabel("Thoi gian render: 00:00")
+        self.export_timer_label.setObjectName("subtleText")
+        self.export_timer_label.setVisible(False)
+        self.export_started_at: float | None = None
+        self.export_timer = QTimer(self)
+        self.export_timer.setInterval(1000)
+        self.export_timer.timeout.connect(self._update_export_timer)
 
         self.audio_output = QAudioOutput(self)
         self.media_player = QMediaPlayer(self)
@@ -194,6 +202,7 @@ class MainWindow(QMainWindow):
         player_row.addWidget(self.player_status)
         bottom_layout.addLayout(player_row)
         bottom_layout.addWidget(self.progress)
+        bottom_layout.addWidget(self.export_timer_label)
         root_layout.addWidget(bottom_card)
 
         self.setCentralWidget(root)
@@ -389,6 +398,7 @@ class MainWindow(QMainWindow):
 
         self.progress.setVisible(True)
         self.progress.setValue(0)
+        self._start_export_timer()
         retry_only = self._resolve_retry_indices()
         self.worker = TtsWorker(
             config=self.config,
@@ -418,29 +428,63 @@ class MainWindow(QMainWindow):
     def _on_export_done(self, path: str) -> None:
         self.progress.setValue(100)
         self.progress.setVisible(False)
+        elapsed_text = self._stop_export_timer()
         self.pending_failed_segments = []
-        log_info(f"Export done path={path}")
-        QMessageBox.information(self, tr("dlg.done_title"), tr("dlg.export_done", path=path))
+        log_info(f"Export done path={path} elapsed={elapsed_text}")
+        QMessageBox.information(
+            self,
+            tr("dlg.done_title"),
+            f"{tr('dlg.export_done', path=path)}\nThoi gian render: {elapsed_text}",
+        )
         self._play_audio_file(path)
         self._update_ui_state()
 
     def _on_export_incomplete(self, failed_segments: object) -> None:
         self.progress.setVisible(False)
+        elapsed_text = self._stop_export_timer()
         failed_list = sorted(int(x) for x in (failed_segments or []))
         self.pending_failed_segments = failed_list
-        log_error(f"Export incomplete failed_segments={failed_list}")
+        log_error(f"Export incomplete failed_segments={failed_list} elapsed={elapsed_text}")
         QMessageBox.warning(
             self,
             tr("dlg.export_incomplete_title"),
-            tr("dlg.export_incomplete_msg", items=", ".join(str(i) for i in failed_list)),
+            f"{tr('dlg.export_incomplete_msg', items=', '.join(str(i) for i in failed_list))}"
+            f"\nThoi gian render: {elapsed_text}",
         )
         self._update_ui_state()
 
     def _on_export_error(self, message: str) -> None:
         self.progress.setVisible(False)
+        elapsed_text = self._stop_export_timer()
         log_error(f"Export error: {message}")
-        QMessageBox.critical(self, tr("dlg.error_title"), message)
+        QMessageBox.critical(self, tr("dlg.error_title"), f"{message}\nThoi gian render: {elapsed_text}")
         self._update_ui_state()
+
+    def _start_export_timer(self) -> None:
+        self.export_started_at = time.monotonic()
+        self.export_timer_label.setVisible(True)
+        self._update_export_timer()
+        self.export_timer.start()
+
+    def _stop_export_timer(self) -> str:
+        self.export_timer.stop()
+        elapsed = self._current_export_elapsed()
+        self.export_timer_label.setText(f"Thoi gian render: {elapsed}")
+        self.export_started_at = None
+        return elapsed
+
+    def _update_export_timer(self) -> None:
+        self.export_timer_label.setText(f"Thoi gian render: {self._current_export_elapsed()}")
+
+    def _current_export_elapsed(self) -> str:
+        if self.export_started_at is None:
+            return "00:00"
+        total_seconds = int(time.monotonic() - self.export_started_at)
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
 
     def _resolve_retry_indices(self) -> list[int]:
         if not self.pending_failed_segments:
